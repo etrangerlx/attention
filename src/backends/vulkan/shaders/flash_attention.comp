@@ -1,0 +1,282 @@
+readonly#version 450 core
+
+// Enable subgroup operations extension
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// Workgroup configuration optimized for Vulkan
+layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// Descriptor set layout for buffers
+layout(set = 0, binding = 0, std430) readonly restrict buffer QueryBuffer {
+    float query_data[];
+};
+
+layout(set = 0, binding = 1, std430) readonly restrict buffer KeyBuffer {
+    float key_data[];
+};
+
+layout(set = 0, binding = 2, std430) readonly restrict buffer ValueBuffer {
+    float value_data[];
+};
+
+layout(set = 0, binding = 3, std430) writeonly restrict buffer OutputBuffer {
+    float output_data[];
+};
+
+layout(set = 0, binding = 4, std430) restrict buffer WorkspaceBuffer {
+    float workspace_data[];
+};
+
+layout(set = 0, binding = 5, std430) readonly restrict buffer AttentionMaskBuffer {
+    float attention_mask[];
+};
+
+// Push constants for efficient parameter passing
+layout(push_constant) uniform PushConstants {
+    uint batch_size;
+    uint num_heads;
+    uint seq_len;
+    uint head_dim;
+    float scale;
+    uint causal_mask;
+    uint block_size_q;
+    uint block_size_k;
+    uint has_mask;
+} push_const;
+
+// Shared memory for efficient cache utilization
+shared float s_query[1024];     // Query block cache
+shared float s_key[1024];       // Key block cache  
+shared float s_value[1024];     // Value block cache
+shared float s_scores[1024];    // Attention scores cache
+shared float s_output[1024];    // Output accumulator
+shared float s_max_vals[32];    // Per-thread max values for softmax
+shared float s_sum_vals[32];    // Per-thread sum values for softmax
+
+// Subgroup-optimized dot product
+float subgroup_dot_product(uint q_offset, uint k_offset, uint dim) {
+    float sum = 0.0;
+    
+    // Vectorized computation with subgroup cooperation
+    for (uint d = gl_SubgroupInvocationID; d < dim; d += gl_SubgroupSize) {
+        sum += s_query[q_offset + d] * s_key[k_offset + d];
+    }
+    
+    // Subgroup reduction for final dot product
+    return subgroupAdd(sum);
+}
+
+// Subgroup-optimized softmax computation
+void subgroup_softmax(uint start_idx, uint length, inout float max_val, inout float sum_exp) {
+    // Find maximum value using subgroup operations
+    float thread_max = -1e30;
+    for (uint i = gl_SubgroupInvocationID; i < length; i += gl_SubgroupSize) {
+        thread_max = max(thread_max, s_scores[start_idx + i]);
+    }
+    thread_max = subgroupMax(thread_max);
+    
+    // Update global maximum
+    float old_max = max_val;
+    max_val = max(max_val, thread_max);
+    float scale_factor = exp(old_max - max_val);
+    
+    // Scale existing sum
+    sum_exp *= scale_factor;
+    
+    // Compute exponentials and new sum
+    float thread_sum = 0.0;
+    for (uint i = gl_SubgroupInvocationID; i < length; i += gl_SubgroupSize) {
+        float exp_val = exp(s_scores[start_idx + i] - max_val);
+        s_scores[start_idx + i] = exp_val;
+        thread_sum += exp_val;
+    }
+    
+    // Subgroup reduction for sum
+    thread_sum = subgroupAdd(thread_sum);
+    sum_exp += thread_sum;
+}
+
+// Memory coalescing helper for loading data
+void coalesced_load_query(uint batch_idx, uint head_idx, uint q_start, uint q_size) {
+    uint head_offset = (batch_idx * push_const.num_heads + head_idx) * push_const.seq_len * push_const.head_dim;
+    
+    // Load query data with optimal memory access pattern
+    for (uint i = gl_LocalInvocationID.x; i < q_size * push_const.head_dim; i += gl_WorkGroupSize.x) {
+        uint q_idx = i / push_const.head_dim;
+        uint d_idx = i % push_const.head_dim;
+        if (q_start + q_idx < push_const.seq_len) {
+            s_query[i] = query_data[head_offset + (q_start + q_idx) * push_const.head_dim + d_idx];
+        } else {
+            s_query[i] = 0.0;
+        }
+    }
+}
+
+void coalesced_load_kv(uint batch_idx, uint head_idx, uint k_start, uint k_size) {
+    uint head_offset = (batch_idx * push_const.num_heads + head_idx) * push_const.seq_len * push_const.head_dim;
+    
+    // Load key and value data with memory coalescing
+    for (uint i = gl_LocalInvocationID.x; i < k_size * push_const.head_dim; i += gl_WorkGroupSize.x) {
+        uint k_idx = i / push_const.head_dim;
+        uint d_idx = i % push_const.head_dim;
+        if (k_start + k_idx < push_const.seq_len) {
+            s_key[i] = key_data[head_offset + (k_start + k_idx) * push_const.head_dim + d_idx];
+            s_value[i] = value_data[head_offset + (k_start + k_idx) * push_const.head_dim + d_idx];
+        } else {
+            s_key[i] = 0.0;
+            s_value[i] = 0.0;
+        }
+    }
+}
+
+// Subgroup-optimized memory barrier
+void subgroup_barrier() {
+    subgroupBarrier();
+    memoryBarrierShared();
+    barrier();
+}
+
+// Main compute shader entry point
+void main() {
+    // Dispatch configuration
+    const uint batch_idx = gl_WorkGroupID.z;
+    const uint head_idx = gl_WorkGroupID.y;
+    const uint q_block_idx = gl_WorkGroupID.x;
+    
+    const uint tid = gl_LocalInvocationID.x;
+    const uint subgroup_id = gl_SubgroupID;
+    const uint subgroup_local_id = gl_SubgroupInvocationID;
+    
+    // Bounds checking
+    if (batch_idx >= push_const.batch_size || head_idx >= push_const.num_heads) {
+        return;
+    }
+    
+    // Calculate query block boundaries
+    const uint q_start = q_block_idx * push_const.block_size_q;
+    const uint q_end = min(q_start + push_const.block_size_q, push_const.seq_len);
+    const uint q_size = q_end - q_start;
+    
+    if (q_size == 0) {
+        return;
+    }
+    
+    // Initialize shared memory
+    for (uint i = tid; i < q_size * push_const.head_dim; i += gl_WorkGroupSize.x) {
+        s_output[i] = 0.0;
+    }
+    
+    // Initialize per-subgroup softmax state
+    if (subgroup_local_id < q_size) {
+        s_max_vals[subgroup_id * 32 + subgroup_local_id] = -1e30;
+        s_sum_vals[subgroup_id * 32 + subgroup_local_id] = 0.0;
+    }
+    
+    subgroup_barrier();
+    
+    // Load query block with memory coalescing
+    coalesced_load_query(batch_idx, head_idx, q_start, q_size);
+    subgroup_barrier();
+    
+    // Process key-value blocks
+    for (uint k_block_start = 0; k_block_start < push_const.seq_len; k_block_start += push_const.block_size_k) {
+        const uint k_end = min(k_block_start + push_const.block_size_k, push_const.seq_len);
+        const uint k_size = k_end - k_block_start;
+        
+        if (k_size == 0) break;
+        
+        // Load key-value block with memory coalescing
+        coalesced_load_kv(batch_idx, head_idx, k_block_start, k_size);
+        subgroup_barrier();
+        
+        // Compute attention scores using subgroup operations
+        for (uint q_idx = 0; q_idx < q_size; q_idx++) {
+            // Distribute key computations across subgroup
+            for (uint k_idx = subgroup_local_id; k_idx < k_size; k_idx += gl_SubgroupSize) {
+                // Compute dot product using subgroup cooperation
+                float score = 0.0;
+                for (uint d = 0; d < push_const.head_dim; d++) {
+                    score += s_query[q_idx * push_const.head_dim + d] * s_key[k_idx * push_const.head_dim + d];
+                }
+                
+                // Apply scaling
+                score *= push_const.scale;
+                
+                // Apply causal mask
+                if (push_const.causal_mask != 0 && (q_start + q_idx) < (k_block_start + k_idx)) {
+                    score = -1e30;
+                }
+                
+                // Apply attention mask if provided
+                if (push_const.has_mask != 0) {
+                    uint mask_offset = batch_idx * push_const.seq_len * push_const.seq_len + 
+                                     (q_start + q_idx) * push_const.seq_len + (k_block_start + k_idx);
+                    if (attention_mask[mask_offset] == 0.0) {
+                        score = -1e30;
+                    }
+                }
+                
+                s_scores[q_idx * push_const.block_size_k + k_idx] = score;
+            }
+            
+            subgroup_barrier();
+            
+            // Online softmax update using subgroup operations
+            uint max_idx = subgroup_id * 32 + q_idx;
+            if (q_idx < q_size && max_idx < 32) {
+                subgroup_softmax(q_idx * push_const.block_size_k, k_size, 
+                               s_max_vals[max_idx], s_sum_vals[max_idx]);
+            }
+            
+            subgroup_barrier();
+        }
+        
+        // Compute weighted values using subgroup cooperation
+        for (uint q_idx = 0; q_idx < q_size; q_idx++) {
+            // Normalize attention weights
+            float normalizer = 1.0 / s_sum_vals[subgroup_id * 32 + q_idx];
+            
+            for (uint k_idx = subgroup_local_id; k_idx < k_size; k_idx += gl_SubgroupSize) {
+                s_scores[q_idx * push_const.block_size_k + k_idx] *= normalizer;
+            }
+            
+            subgroup_barrier();
+            
+            // Compute weighted sum using subgroup reduction
+            for (uint d = subgroup_local_id; d < push_const.head_dim; d += gl_SubgroupSize) {
+                float weighted_sum = 0.0;
+                for (uint k_idx = 0; k_idx < k_size; k_idx++) {
+                    weighted_sum += s_scores[q_idx * push_const.block_size_k + k_idx] * 
+                                   s_value[k_idx * push_const.head_dim + d];
+                }
+                
+                // Accumulate using atomic operations for race-free updates
+                atomicAdd(s_output[q_idx * push_const.head_dim + d], weighted_sum);
+            }
+            
+            subgroup_barrier();
+        }
+    }
+    
+    // Final normalization and output writing
+    uint head_offset = (batch_idx * push_const.num_heads + head_idx) * push_const.seq_len * push_const.head_dim;
+    
+    for (uint q_idx = 0; q_idx < q_size; q_idx++) {
+        float final_normalizer = 1.0 / s_sum_vals[subgroup_id * 32 + q_idx];
+        
+        for (uint d = subgroup_local_id; d < push_const.head_dim; d += gl_SubgroupSize) {
+            float final_output = s_output[q_idx * push_const.head_dim + d] * final_normalizer;
+            
+            // Coalesced write to global memory
+            if (q_start + q_idx < push_const.seq_len) {
+                output_data[head_offset + (q_start + q_idx) * push_const.head_dim + d] = final_output;
+            }
+        }
+    }
+    
+    // Ensure all writes complete before termination
+    subgroup_barrier();
+}

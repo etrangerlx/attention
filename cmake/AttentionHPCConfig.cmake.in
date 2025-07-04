@@ -1,0 +1,99 @@
+@PACKAGE_INIT@
+
+# AttentionHPC CMake Package Configuration File
+# This file is used by find_package() to locate AttentionHPC
+
+include(CMakeFindDependencyMacro)
+
+# Set up prefix paths
+set_and_check(PACKAGE_PREFIX_DIR "${PACKAGE_PREFIX_DIR}")
+set_and_check(AttentionHPC_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@/attention_hpc")
+set_and_check(AttentionHPC_LIB_DIR "@PACKAGE_CMAKE_INSTALL_LIBDIR@")
+
+# Define variables for backward compatibility
+set(AttentionHPC_INCLUDE_DIRS "${AttentionHPC_INCLUDE_DIR}")
+set(AttentionHPC_LIBRARIES AttentionHPC::AttentionHPC)
+
+# Required dependencies
+find_dependency(Threads REQUIRED)
+
+# Optional dependencies - find them if they were available during build
+set(AttentionHPC_HAVE_CUDA @HAVE_CUDA@)
+set(AttentionHPC_HAVE_OPENCL @HAVE_OPENCL@)
+set(AttentionHPC_HAVE_VULKAN @HAVE_VULKAN@)
+set(AttentionHPC_HAVE_OPENGL @HAVE_OPENGL@)
+
+if(AttentionHPC_HAVE_CUDA)
+    find_dependency(CUDA)
+    if(NOT CUDA_FOUND)
+        set(AttentionHPC_FOUND FALSE)
+        set(AttentionHPC_NOT_FOUND_MESSAGE "CUDA was required but not found")
+        return()
+    endif()
+endif()
+
+if(AttentionHPC_HAVE_OPENCL)
+    find_dependency(OpenCL)
+    if(NOT OpenCL_FOUND)
+        set(AttentionHPC_FOUND FALSE)
+        set(AttentionHPC_NOT_FOUND_MESSAGE "OpenCL was required but not found")
+        return()
+    endif()
+endif()
+
+if(AttentionHPC_HAVE_VULKAN)
+    find_dependency(Vulkan)
+    if(NOT Vulkan_FOUND)
+        set(AttentionHPC_FOUND FALSE)
+        set(AttentionHPC_NOT_FOUND_MESSAGE "Vulkan was required but not found")
+        return()
+    endif()
+endif()
+
+if(AttentionHPC_HAVE_OPENGL)
+    find_dependency(OpenGL)
+    find_dependency(GLEW)
+    if(NOT OpenGL_FOUND OR NOT GLEW_FOUND)
+        set(AttentionHPC_FOUND FALSE)
+        set(AttentionHPC_NOT_FOUND_MESSAGE "OpenGL or GLEW was required but not found")
+        return()
+    endif()
+endif()
+
+# Import the exported targets
+include("${CMAKE_CURRENT_LIST_DIR}/AttentionHPCTargets.cmake")
+
+# Verify that the imported target exists
+if(NOT TARGET AttentionHPC::AttentionHPC)
+    set(AttentionHPC_FOUND FALSE)
+    set(AttentionHPC_NOT_FOUND_MESSAGE "AttentionHPC::AttentionHPC target not found")
+    return()
+endif()
+
+# Set version variables
+set(AttentionHPC_VERSION "@PROJECT_VERSION@")
+set(AttentionHPC_VERSION_MAJOR "@PROJECT_VERSION_MAJOR@")
+set(AttentionHPC_VERSION_MINOR "@PROJECT_VERSION_MINOR@")
+set(AttentionHPC_VERSION_PATCH "@PROJECT_VERSION_PATCH@")
+
+# Mark as found
+set(AttentionHPC_FOUND TRUE)
+
+# Print information (optional)
+if(NOT AttentionHPC_FIND_QUIETLY)
+    message(STATUS "Found AttentionHPC: ${AttentionHPC_VERSION}")
+    message(STATUS "  Include directories: ${AttentionHPC_INCLUDE_DIRS}")
+    message(STATUS "  Libraries: ${AttentionHPC_LIBRARIES}")
+    if(AttentionHPC_HAVE_CUDA)
+        message(STATUS "  CUDA support: enabled")
+    endif()
+    if(AttentionHPC_HAVE_OPENCL)
+        message(STATUS "  OpenCL support: enabled")
+    endif()
+    if(AttentionHPC_HAVE_VULKAN)
+        message(STATUS "  Vulkan support: enabled")
+    endif()
+    if(AttentionHPC_HAVE_OPENGL)
+        message(STATUS "  OpenGL support: enabled")
+    endif()
+endif()

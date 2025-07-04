@@ -1,0 +1,223 @@
+#version 430 core
+
+// Workgroup configuration
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Buffer bindings
+layout(std430, binding = 0) readonly buffer QueryBuffer {
+    float query[];
+};
+
+layout(std430, binding = 1) readonly buffer KeyBuffer {
+    float key[];
+};
+
+layout(std430, binding = 2) readonly buffer ValueBuffer {
+    float value[];
+};
+
+layout(std430, binding = 3) writeonly buffer OutputBuffer {
+    float output[];
+};
+
+layout(std430, binding = 4) buffer WorkspaceBuffer {
+    float workspace[];
+};
+
+layout(std430, binding = 5) readonly buffer AttentionMaskBuffer {
+    float attention_mask[]; // Optional attention mask
+};
+
+// Uniform parameters
+uniform int batch_size;
+uniform int num_heads;
+uniform int seq_len;
+uniform int head_dim;
+uniform float scale;
+uniform int causal_mask;
+uniform int block_size_q;
+uniform int block_size_k;
+uniform int has_mask;
+
+// Shared memory
+shared float s_query[256];       // Query block cache
+shared float s_key[256];         // Key block cache
+shared float s_value[256];       // Value block cache
+shared float s_scores[256];      // Attention scores
+shared float s_softmax_sum[32];  // Softmax normalization sums
+shared float s_softmax_max[32];  // Softmax max values
+shared float s_output[256];      // Output accumulator
+
+// Helper functions
+float dot_product(uint q_idx, uint k_idx, uint dim) {
+    float sum = 0.0;
+    for (uint d = 0; d < dim; d++) {
+        sum += s_query[q_idx * dim + d] * s_key[k_idx * dim + d];
+    }
+    return sum;
+}
+
+void barrier_and_clear_shared_memory() {
+    memoryBarrierShared();
+    barrier();
+}
+
+// Online softmax computation
+void compute_online_softmax(uint q_idx, float score, inout float max_val, inout float sum_exp) {
+    // Update max value
+    float prev_max = max_val;
+    max_val = max(max_val, score);
+    
+    // Scale factor for numerically stable softmax
+    float scale_factor = exp(prev_max - max_val);
+    
+    // Scale existing accumulated values
+    sum_exp *= scale_factor;
+    
+    // Add new exponentiated value
+    float exp_score = exp(score - max_val);
+    sum_exp += exp_score;
+    
+    // Store normalized score in shared memory
+    s_scores[q_idx] = exp_score;
+}
+
+void main() {
+    // Global invocation position
+    const uint batch_idx = gl_WorkGroupID.z;
+    const uint head_idx = gl_WorkGroupID.y;
+    const uint q_block_idx = gl_WorkGroupID.x;
+    
+    const uint tid_x = gl_LocalInvocationID.x;
+    const uint tid_y = gl_LocalInvocationID.y;
+    const uint local_tid = tid_y * gl_WorkGroupSize.x + tid_x;
+    const uint local_size = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+    
+    // Check bounds
+    if (batch_idx >= batch_size || head_idx >= num_heads) {
+        return;
+    }
+    
+    // Calculate start positions
+    const uint q_start = q_block_idx * block_size_q;
+    const uint q_end = min(q_start + block_size_q, seq_len);
+    const uint q_size = q_end - q_start;
+    
+    if (q_size <= 0) {
+        return;
+    }
+    
+    // Base offset for the current batch and head
+    const uint head_offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim;
+    
+    // Initialize output accumulators for each query position
+    for (uint i = local_tid; i < q_size * head_dim; i += local_size) {
+        s_output[i] = 0.0;
+    }
+    
+    // Initialize softmax state
+    float max_vals[16];  // Per-thread max values
+    float sum_exp[16];   // Per-thread sum of exponentials
+    
+    for (uint q = 0; q < min(16u, q_size); q++) {
+        max_vals[q] = -1.0e30;   // Negative infinity for practical purposes
+        sum_exp[q] = 0.0;
+    }
+    
+    barrier_and_clear_shared_memory();
+    
+    // Load query block into shared memory
+    for (uint i = local_tid; i < q_size * head_dim; i += local_size) {
+        uint q_idx = i / head_dim;
+        uint d_idx = i % head_dim;
+        
+        if (q_start + q_idx < seq_len) {
+            s_query[i] = query[head_offset + (q_start + q_idx) * head_dim + d_idx];
+        }
+    }
+    
+    barrier_and_clear_shared_memory();
+    
+    // Process key-value blocks
+    for (uint k_block_start = 0; k_block_start < seq_len; k_block_start += block_size_k) {
+        const uint k_end = min(k_block_start + block_size_k, seq_len);
+        const uint k_size = k_end - k_block_start;
+        
+        if (k_size <= 0) {
+            break;
+        }
+        
+        // Load key and value blocks into shared memory
+        for (uint i = local_tid; i < k_size * head_dim; i += local_size) {
+            uint k_idx = i / head_dim;
+            uint d_idx = i % head_dim;
+            
+            if (k_block_start + k_idx < seq_len) {
+                s_key[i] = key[head_offset + (k_block_start + k_idx) * head_dim + d_idx];
+                s_value[i] = value[head_offset + (k_block_start + k_idx) * head_dim + d_idx];
+            }
+        }
+        
+        barrier_and_clear_shared_memory();
+        
+        // Compute attention scores for each query position
+        for (uint q_idx = 0; q_idx < q_size; q_idx++) {
+            // Skip if this thread doesn't process this query
+            if (q_idx % gl_WorkGroupSize.x != tid_x) {
+                continue;
+            }
+            
+            for (uint k_idx = 0; k_idx < k_size; k_idx++) {
+                // Compute attention score
+                float score = dot_product(q_idx, k_idx, head_dim) * scale;
+                
+                // Apply causal mask if needed
+                if (causal_mask != 0 && (q_start + q_idx) < (k_block_start + k_idx)) {
+                    score = -1.0e30;  // Set to negative infinity for masked positions
+                }
+                
+                // Apply attention mask if provided
+                if (has_mask != 0) {
+                    uint mask_offset = batch_idx * seq_len * seq_len + (q_start + q_idx) * seq_len + (k_block_start + k_idx);
+                    if (attention_mask[mask_offset] == 0.0) {
+                        score = -1.0e30;  // Set to negative infinity for masked positions
+                    }
+                }
+                
+                // Update online softmax state
+                compute_online_softmax(k_idx, score, max_vals[q_idx], sum_exp[q_idx]);
+            }
+            
+            barrier_and_clear_shared_memory();
+            
+            // Normalize softmax scores
+            float inv_sum = 1.0 / sum_exp[q_idx];
+            for (uint k_idx = 0; k_idx < k_size; k_idx++) {
+                s_scores[k_idx] *= inv_sum;
+            }
+            
+            barrier_and_clear_shared_memory();
+            
+            // Compute weighted values and accumulate to output
+            for (uint d = 0; d < head_dim; d++) {
+                float weighted_sum = 0.0;
+                for (uint k_idx = 0; k_idx < k_size; k_idx++) {
+                    weighted_sum += s_scores[k_idx] * s_value[k_idx * head_dim + d];
+                }
+                s_output[q_idx * head_dim + d] += weighted_sum;
+            }
+            
+            barrier_and_clear_shared_memory();
+        }
+    }
+    
+    // Write output to global memory
+    for (uint i = local_tid; i < q_size * head_dim; i += local_size) {
+        uint q_idx = i / head_dim;
+        uint d_idx = i % head_dim;
+        
+        if (q_start + q_idx < seq_len) {
+            output[head_offset + (q_start + q_idx) * head_dim + d_idx] = s_output[i];
+        }
+    }
+}

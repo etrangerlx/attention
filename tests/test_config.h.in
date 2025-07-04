@@ -1,0 +1,83 @@
+#ifndef TEST_CONFIG_H
+#define TEST_CONFIG_H
+
+// Project version information
+#define ATTENTION_HPC_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define ATTENTION_HPC_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define ATTENTION_HPC_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define ATTENTION_HPC_VERSION "@PROJECT_VERSION@"
+
+// Build configuration
+#define CMAKE_BUILD_TYPE "@CMAKE_BUILD_TYPE@"
+#define CMAKE_CXX_STANDARD @CMAKE_CXX_STANDARD@
+
+// Test data directory
+#define TEST_DATA_DIR "@TEST_DATA_DIR@"
+
+// Backend availability
+#cmakedefine HAVE_CUDA
+#cmakedefine HAVE_OPENCL
+#cmakedefine HAVE_VULKAN
+#cmakedefine HAVE_OPENGL
+
+// Optional testing features
+#cmakedefine BUILD_PERFORMANCE_TESTS
+#cmakedefine ENABLE_COVERAGE
+#cmakedefine VALGRIND_FOUND
+
+// System information
+#define CMAKE_SYSTEM_NAME "@CMAKE_SYSTEM_NAME@"
+#define CMAKE_SYSTEM_PROCESSOR "@CMAKE_SYSTEM_PROCESSOR@"
+
+// Compiler information
+#define CMAKE_CXX_COMPILER_ID "@CMAKE_CXX_COMPILER_ID@"
+#define CMAKE_CXX_COMPILER_VERSION "@CMAKE_CXX_COMPILER_VERSION@"
+
+// Installation paths
+#define CMAKE_INSTALL_PREFIX "@CMAKE_INSTALL_PREFIX@"
+#define CMAKE_INSTALL_LIBDIR "@CMAKE_INSTALL_LIBDIR@"
+#define CMAKE_INSTALL_INCLUDEDIR "@CMAKE_INSTALL_INCLUDEDIR@"
+
+// Debug/Release specific definitions
+#ifdef DEBUG
+    #define TEST_DEBUG_MODE 1
+#else
+    #define TEST_DEBUG_MODE 0
+#endif
+
+// Helper macros for conditional testing
+#ifdef HAVE_CUDA
+    #define TEST_CUDA_AVAILABLE 1
+#else
+    #define TEST_CUDA_AVAILABLE 0
+#endif
+
+#ifdef HAVE_OPENCL
+    #define TEST_OPENCL_AVAILABLE 1
+#else
+    #define TEST_OPENCL_AVAILABLE 0
+#endif
+
+#ifdef HAVE_VULKAN
+    #define TEST_VULKAN_AVAILABLE 1
+#else
+    #define TEST_VULKAN_AVAILABLE 0
+#endif
+
+#ifdef HAVE_OPENGL
+    #define TEST_OPENGL_AVAILABLE 1
+#else
+    #define TEST_OPENGL_AVAILABLE 0
+#endif
+
+// Test timeout values (in seconds)
+#define TEST_TIMEOUT_SHORT 30
+#define TEST_TIMEOUT_MEDIUM 120
+#define TEST_TIMEOUT_LONG 300
+
+// Memory limits for testing
+#define TEST_MAX_MEMORY_MB 1024
+#define TEST_MAX_BATCH_SIZE 32
+#define TEST_MAX_SEQUENCE_LENGTH 2048
+
+#endif // TEST_CONFIG_H
